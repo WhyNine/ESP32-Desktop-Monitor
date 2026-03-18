@@ -7,12 +7,12 @@ per-pixel updates to the ESP32 receiver using the same pixel-update protocol.
 
 import argparse
 import socket
+import select
 import struct
 import time
 from typing import Optional, Sequence
 
 import cv2
-import mss
 import numpy as np
 import ctypes
 
@@ -32,6 +32,8 @@ DISPLAY_WIDTH = 135
 DISPLAY_HEIGHT = 240
 HEADER_VERSION = 0x02  # carries frame_id in header (pixels)
 RUN_HEADER_VERSION = 0x01  # version for run packets
+CLIENT_START = 0x31
+CLIENT_STOP = 0x32
 
 
 class ScreenshotPixelSender:
@@ -47,6 +49,7 @@ class ScreenshotPixelSender:
         max_updates_per_frame: int,
         rotate_deg: int,
         show_cursor: bool,
+        backend: str,
     ) -> None:
         self.ip = ip
         self.port = port
@@ -58,13 +61,13 @@ class ScreenshotPixelSender:
         self.max_updates_per_frame = max_updates_per_frame
         self.rotate_deg = rotate_deg
         self.show_cursor = show_cursor
+        self.backend = backend
 
         self.sock: Optional[socket.socket] = None
         self.prev_rgb: Optional[np.ndarray] = None  # (H, W, 3) uint8
         self.sent_initial_full: bool = False
         self.frame_id: int = 0
         self.monitor: Optional[dict] = None
-        self.sct: Optional[mss.mss] = None
         self.cursor_warned: bool = False
         self.cursor_backend: Optional[tuple[str, Optional[ctypes.CDLL]]] = self._init_cursor_backend()
 
@@ -140,7 +143,9 @@ class ScreenshotPixelSender:
             return None
         return min(usable_monitors, key=lambda m: m.get("left", 0))
 
-    def setup_capture(self) -> bool:
+    def setup_capture_windows(self) -> bool:
+        import mss
+        self.sct: Optional[mss.mss] = None
         try:
             self.sct = mss.mss()
         except Exception as exc:  # noqa: BLE001
@@ -159,7 +164,40 @@ class ScreenshotPixelSender:
         )
         return True
 
-    def grab_frame(self) -> Optional[np.ndarray]:
+    def setup_capture_dsi(self) -> bool:
+        import subprocess
+        self.display_name = "DSI-1" # Common for Pi DSI; can be customized
+        """Verify grim is installed and identify the display."""
+        try:
+            # Check if grim is available
+            subprocess.run(["grim", "-h"], capture_output=True, check=True)
+            print(f"[MON] Found grim. Target display: {self.display_name}")
+            return True
+        except Exception as exc:
+            print(f"[MON] grim not found. Install it with 'sudo apt install grim'. Error: {exc}")
+            return False
+
+    def setup_capture_framebuffer(self) -> bool:
+        import os
+        self.fb_device = "/dev/fb0"  # Default for most small LCDs
+        self.width = 240            # Match your local LCD's hardware resolution
+        self.height = 320
+        self.bpp = 2                # 2 for RGB565 (16-bit), 4 for RGBA (32-bit)
+        if os.path.exists(self.fb_device):
+            print(f"[MON] Found framebuffer at {self.fb_device}")
+            return True
+        print(f"[MON] {self.fb_device} not found. Check if your LCD driver is loaded.")
+        return False
+
+    def setup_capture(self) -> bool:
+        if self.backend == "windows":
+            return self.setup_capture_windows()
+        if self.backend == "dsi":
+            return self.setup_capture_dsi()
+        if self.backend == "framebuffer":
+            return self.setup_capture_framebuffer()
+
+    def grab_frame_windows(self) -> Optional[np.ndarray]:
         if not self.sct or not self.monitor:
             return None
         try:
@@ -170,6 +208,66 @@ class ScreenshotPixelSender:
         # mss returns BGRA; drop alpha
         frame = np.array(shot)[:, :, :3]
         return frame
+    
+    def grab_frame_dsi(self) -> Optional[np.ndarray]:
+        import subprocess
+        from PIL import Image
+        import io
+        """Captures frame using grim and converts to NumPy array."""
+        try:
+            # -t ppm: uses raw pixels (fastest for processing)
+            # -o: targets the specific DSI display
+            # -c: includes the cursor automatically!
+            cmd = ["grim", "-t", "ppm"]
+            if self.show_cursor:
+                cmd.append("-c")
+            cmd.extend(["-o", self.display_name, "-"])
+
+            result = subprocess.run(cmd, capture_output=True, check=True)
+
+            # Load bytes into Pillow, then convert to NumPy
+            with Image.open(io.BytesIO(result.stdout)) as img:
+                # Convert Pillow RGB to NumPy array
+                frame_rgb = np.array(img)
+                # Convert RGB to BGR for your existing OpenCV logic
+                frame_bdsi = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                return frame_bdsi
+        except subprocess.CalledProcessError as e:
+            print(f"[MON] Grim failed. Is your display name '{self.display_name}' correct? Error: {e}")
+            return None
+        except Exception as exc:
+            print(f"[MON] Grim capture failed: {exc}")
+            return None
+
+    def grab_frame_framebuffer(self) -> Optional[np.ndarray]:
+        try:
+            with open(self.fb_device, "rb") as f:
+                # Read the exact number of bytes for one frame
+                raw_data = f.read(self.width * self.height * self.bpp)
+                
+                # Convert raw bytes to a NumPy array
+                # For 16-bit (RGB565):
+                frame = np.frombuffer(raw_data, dtype=np.uint16).reshape((self.height, self.width))
+                
+                # Since your transmitter expects BGR for processing:
+                # We extract the RGB565 components and convert to 8-bit BGR
+                bgr = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+                bgr[..., 0] = (frame & 0x001F) << 3         # Blue
+                bgr[..., 1] = ((frame & 0x07E0) >> 5) << 2  # Green
+                bgr[..., 2] = ((frame & 0xF800) >> 11) << 3 # Red
+                
+                return bgr
+        except Exception as exc:
+            print(f"[MON] Framebuffer read failed: {exc}")
+            return None
+
+    def grab_frame(self) -> Optional[np.ndarray]:
+      if self.backend == "windows":
+          return self.grab_frame_windows()
+      if self.backend == "dsi":
+          return self.grab_frame_dsi()
+      if self.backend == "framebuffer":
+          return self.grab_frame_framebuffer()
 
     # Cursor helpers -----------------------------------------------------
     def get_cursor_global(self) -> Optional[tuple[int, int]]:
@@ -339,7 +437,7 @@ class ScreenshotPixelSender:
             payload = bytearray(header)
             append = payload.extend
             for x, y, color in zip(xs[start:end], ys[start:end], colors[start:end]):
-                append(struct.pack("<BBH", int(x), int(y), int(color)))
+                append(struct.pack("<HHH", int(x), int(y), int(color)))
             packets.append(bytes(payload))
             start = end
         return packets
@@ -390,7 +488,7 @@ class ScreenshotPixelSender:
             payload = bytearray(header)
             append = payload.extend
             for y, x0, length, color in runs[start:end]:
-                append(struct.pack("<BBBH", y, x0, length, color))
+                append(struct.pack("<HHBH", y, x0, length, color))
             packets.append(bytes(payload))
             start = end
         return packets
@@ -402,84 +500,99 @@ class ScreenshotPixelSender:
         if not self.ensure_connection():
             return
 
-        frame_delay = 1.0 / self.target_fps if self.target_fps > 0 else 0.0
+        frame_delay = 1.0 / self.target_fps if self.target_fps > 0 else 1.0
         frame_count = 0
         sent_packets = 0
         sent_pixels = 0
+        send_frames = False
         start_t = time.time()
 
         print("[STREAM] Starting screenshot update loop (Ctrl+C to stop)")
         try:
             while True:
-                frame_start = time.time()
-                frame = self.grab_frame()
-                if frame is None:
-                    print("[STREAM] Capture stopped")
-                    break
+                ready, _, _ = select.select([self.sock], [], [], 0)
+                if ready:
+                    data = self.sock.recv(1024)
+                    if (data and data[0] == CLIENT_START):
+                        self.sent_initial_full = False
+                        send_frames = True
+                        print("[INIT] Received start command")
+                    if (data and data[0] == CLIENT_STOP):
+                        send_frames = False
+                        print("[INIT] Received stop command")
 
-                cursor_point = None
-                if self.show_cursor:
-                    cur = self.get_cursor_global()
-                    if cur:
-                        cursor_point = self.map_cursor_to_local(cur)
-                    else:
-                        print("[CURSOR] Unable to read cursor position")
+                if send_frames:
+                  frame_start = time.time()
+                  frame = self.grab_frame()
+                  if frame is None:
+                      print("[STREAM] Capture stopped")
+                      break
 
-                rgb, rgb565 = self.resize_and_convert(frame, cursor_point)
-                packets = self.build_packets(rgb, rgb565)
-                self.prev_rgb = rgb
+                  cursor_point = None
+                  if self.show_cursor:
+                      cur = self.get_cursor_global()
+                      if cur:
+                          cursor_point = self.map_cursor_to_local(cur)
+                      else:
+                          print("[CURSOR] Unable to read cursor position")
 
-                if not self.ensure_connection():
-                    print("[SEND] Could not reconnect; exiting")
-                    break
+                  rgb, rgb565 = self.resize_and_convert(frame, cursor_point)
+                  packets = self.build_packets(rgb, rgb565)
+                  self.prev_rgb = rgb
 
-                for pkt in packets:
-                    updates_in_frame = struct.unpack_from("<H", pkt, 9)[0]
-                    print(f"[FRAME] id={struct.unpack_from('<I', pkt, 5)[0]} updates={updates_in_frame}")
-                    try:
-                        self.sock.sendall(pkt)
-                        sent_packets += 1
-                        sent_pixels += updates_in_frame
-                        if not self.sent_initial_full:
-                            self.sent_initial_full = True
-                    except (BrokenPipeError, ConnectionResetError):
-                        print("[SEND] Connection lost; attempting reconnect")
-                        self.disconnect()
-                        if not self.ensure_connection():
-                            print("[SEND] Reconnect failed; exiting")
-                            break
-                        try:
-                            self.sock.sendall(pkt)
-                            sent_packets += 1
-                            sent_pixels += updates_in_frame
-                        except Exception as exc:  # noqa: BLE001
-                            print(f"[SEND] Retry failed: {type(exc).__name__}: {exc}")
-                            break
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"[SEND] Error: {type(exc).__name__}: {exc}")
-                        self.disconnect()
-                        break
+                  if not self.ensure_connection():
+                      print("[SEND] Could not reconnect; exiting")
+                      break
+
+                  for pkt in packets:
+                      updates_in_frame = struct.unpack_from("<H", pkt, 9)[0]
+                      print(f"[FRAME] id={struct.unpack_from('<I', pkt, 5)[0]} updates={updates_in_frame}")
+                      try:
+                          self.sock.sendall(pkt)
+                          sent_packets += 1
+                          sent_pixels += updates_in_frame
+                          if not self.sent_initial_full:
+                              self.sent_initial_full = True
+                      except (BrokenPipeError, ConnectionResetError):
+                          print("[SEND] Connection lost; attempting reconnect")
+                          self.disconnect()
+                          if not self.ensure_connection():
+                              print("[SEND] Reconnect failed; exiting")
+                              break
+                          try:
+                              self.sock.sendall(pkt)
+                              sent_packets += 1
+                              sent_pixels += updates_in_frame
+                          except Exception as exc:  # noqa: BLE001
+                              print(f"[SEND] Retry failed: {type(exc).__name__}: {exc}")
+                              break
+                      except Exception as exc:  # noqa: BLE001
+                          print(f"[SEND] Error: {type(exc).__name__}: {exc}")
+                          #self.disconnect()
+                          #break
+                  else:
+                      frame_count += 1
+                      now = time.time()
+                      elapsed_frame = now - frame_start
+                      if frame_delay > 0 and elapsed_frame < frame_delay:
+                          time.sleep(frame_delay - elapsed_frame)
+
+                      # Stats roughly every second
+                      if now - start_t >= 1.0:
+                          elapsed = now - start_t
+                          fps_est = frame_count / elapsed if elapsed > 0 else 0.0
+                          print(
+                              f"[STATS] frames:{frame_count} packets:{sent_packets} "
+                              f"pixels:{sent_pixels} fps~{fps_est:.2f}"
+                          )
+                          start_t = now
+                          frame_count = 0
+                          sent_packets = 0
+                          sent_pixels = 0
+                      continue
+                  break  # outer while if inner loop broke
                 else:
-                    frame_count += 1
-                    now = time.time()
-                    elapsed_frame = now - frame_start
-                    if frame_delay > 0 and elapsed_frame < frame_delay:
-                        time.sleep(frame_delay - elapsed_frame)
-
-                    # Stats roughly every second
-                    if now - start_t >= 1.0:
-                        elapsed = now - start_t
-                        fps_est = frame_count / elapsed if elapsed > 0 else 0.0
-                        print(
-                            f"[STATS] frames:{frame_count} packets:{sent_packets} "
-                            f"pixels:{sent_pixels} fps~{fps_est:.2f}"
-                        )
-                        start_t = now
-                        frame_count = 0
-                        sent_packets = 0
-                        sent_pixels = 0
-                    continue
-                break  # outer while if inner loop broke
+                    time.sleep(frame_delay)
         except KeyboardInterrupt:
             print("\n[STREAM] Interrupted by user")
         finally:
@@ -540,6 +653,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Draw the cursor location onto the captured frame (requires Quartz/pyobjc on macOS)",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["windows", "dsi", "framebuffer"],
+        required=True,
+        help="Capture backend to use (windows/dsi/framebuffer)"
+    )
     return parser.parse_args(argv)
 
 
@@ -556,6 +675,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         max_updates_per_frame=args.max_updates_per_frame,
         rotate_deg=args.rotate,
         show_cursor=args.show_cursor,
+        backend=args.backend
     )
     sender.run()
 

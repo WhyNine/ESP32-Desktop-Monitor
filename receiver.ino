@@ -1,9 +1,10 @@
 /*
  * Pixel Update Receiver for ESP32 T-Display (ST7789 135x240)
+ * Handles multiple clients and cycles through them using a button
  * Receives per-pixel updates (x, y, RGB565) over TCP and applies them.
  * Protocol v2 (little-endian):
  *   Header: 'P' 'X' 'U' 'P' (4 bytes) + version (1 byte, 0x02) + frame_id (uint32 LE) + count (uint16)
- *   Body:   count entries of: x (uint8), y (uint8), color (uint16 LE)
+ *   Body:   count entries of: x (uint16), y (uint16), color (uint16 LE)
  *
  * Optimized for high frame rates with:
  * - Fast SPI clock (80MHz default, configurable)
@@ -26,6 +27,10 @@ TFT_eSPI tft = TFT_eSPI();
 // Display dimensions
 #define DISPLAY_WIDTH 135
 #define DISPLAY_HEIGHT 240
+#define FRAMEBUFFER_SIZE DISPLAY_WIDTH * DISPLAY_HEIGHT
+
+#define CLIENT_START 0x31
+#define CLIENT_STOP 0x32
 
 // Try the fastest stable SPI clock for the panel; lower to 40000000 if unstable
 const uint32_t SPI_TARGET_FREQ = 80000000;
@@ -36,7 +41,11 @@ const char* password = "YOUR_WIFI_PASSWORD";
 
 // Network settings
 WiFiServer server(8090);  // dedicated port for pixel updates
-WiFiClient client;
+#define MAX_CLIENTS 5
+WiFiClient clients[MAX_CLIENTS];
+int activeClient = -1;
+
+#define SWITCH_BUTTON 0                   // boot button by default
 
 // Protocol constants (v2 adds frame_id to the header)
 const uint8_t MAGIC[4] = {'P', 'X', 'U', 'P'};
@@ -63,26 +72,28 @@ struct PixelUpdate {
   uint16_t color;
 };
 
-PixelUpdate* updateBuffer = nullptr;
 uint32_t bufferCapacity = 0;
 bool dmaEnabled = false;
+uint16_t* framebuffer = nullptr;            // build framebuffer in memory and output full frame after every update
+
+bool lastButton = HIGH;
 
 bool ensureUpdateBuffer(uint32_t needed) {
-  if (needed <= bufferCapacity && updateBuffer != nullptr) {
+  if (needed <= bufferCapacity && entry != nullptr) {
     return true;
   }
-  PixelUpdate* tmp = (PixelUpdate*)ps_malloc(needed * sizeof(PixelUpdate));
+  if (entry) {
+    free(entry);
+  }
+  uint8_t* tmp = (uint8_t*)malloc(needed * sizeof(PixelUpdate));
   if (!tmp) {
-    tmp = (PixelUpdate*)malloc(needed * sizeof(PixelUpdate));
+    tmp = (uint8_t*)ps_malloc(needed * sizeof(PixelUpdate));
   }
   if (!tmp) {
     Serial.println("Failed to allocate update buffer");
     return false;
   }
-  if (updateBuffer) {
-    free(updateBuffer);
-  }
-  updateBuffer = tmp;
+  entry = tmp;
   bufferCapacity = needed;
   return true;
 }
@@ -132,6 +143,8 @@ void setup() {
   delay(500);
   Serial.println("\n=== Pixel Update Receiver ===");
 
+  pinMode(SWITCH_BUTTON, INPUT_PULLUP);
+
   pinMode(4, OUTPUT);
   digitalWrite(4, HIGH);  // backlight
   tft.init();
@@ -168,6 +181,18 @@ void setup() {
   Serial.println("\nWiFi connected");
   Serial.print("IP: ");
   Serial.println(WiFi.localIP());
+  if (dmaEnabled) {
+    Serial.println("DMA enabled");
+  }
+
+  try {
+    framebuffer = (uint16_t*)malloc(FRAMEBUFFER_SIZE << 1);
+  }
+  catch (int errorCode) {
+    Serial.println("Unable to allocate framebuffer");
+    abort();
+  }
+  memset(framebuffer, 0, FRAMEBUFFER_SIZE << 1);
 
   showWaitingScreen();
 
@@ -176,19 +201,87 @@ void setup() {
   Serial.println("Server listening on port 8090");
 }
 
-bool handleClient() {
-  // Accept new client
-  if (!client || !client.connected()) {
-    client = server.available();
-    if (client) {
-      Serial.println("Client connected");
-      client.setNoDelay(true);
-      client.setTimeout(50);  // short timeout for reads
-      frameCount = 0;
-      updatesApplied = 0;
-      tft.fillScreen(TFT_BLACK);
+void switchClient() {
+
+  if (activeClient < 0) return;
+
+  if (clients[activeClient] && clients[activeClient].connected()) {
+    clients[activeClient].write(CLIENT_STOP);
+  }
+
+  int start = activeClient;
+  do {
+    activeClient++;
+    if (activeClient >= MAX_CLIENTS)
+      activeClient = 0;
+
+    if (clients[activeClient] && clients[activeClient].connected()) {
+      Serial.print("Switched to client ");
+      Serial.println(activeClient);
+      memset(framebuffer, 0, FRAMEBUFFER_SIZE << 1);        // clear buffer
+      clients[activeClient].write(CLIENT_START);
+      return;
+    }
+
+  } while (activeClient != start);
+}
+
+// remove disconnected clients and potentially add new client
+void acceptClients() {
+  WiFiClient newClient = server.available();
+
+  for (int i = 0; i < MAX_CLIENTS; i++) {                 // remove disconnected clients from list
+    if (clients[i] && !clients[i].connected()) {
+      clients[i] = NULL;
+      Serial.print("Client ");
+      Serial.print(i);
+      Serial.println(" disconnected");
+      showWaitingScreen();
+      if (activeClient == i) {
+        switchClient();
+      }
     }
   }
+
+  if (newClient) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+      if (!clients[i] || !clients[i].connected()) {
+        clients[i] = newClient;
+        clients[i].setNoDelay(true);
+        clients[i].setTimeout(50);
+
+        Serial.print("Client added at slot ");
+        Serial.println(i);
+
+        if (activeClient == -1) {
+          activeClient = i;
+          clients[activeClient].write(CLIENT_START);
+        } 
+
+        return;
+      }
+    }
+
+    Serial.println("Client list full");
+    newClient.stop();
+  }
+}
+
+void checkButton() {
+  bool current = digitalRead(SWITCH_BUTTON);
+
+  if (lastButton == HIGH && current == LOW) {
+    switchClient();
+    delay(200);
+  }
+
+  lastButton = current;
+}
+
+bool handleClient() {
+  if (activeClient < 0) return false;
+
+  WiFiClient &client = clients[activeClient];
 
   if (!client || !client.connected()) {
     return false;
@@ -209,7 +302,7 @@ bool handleClient() {
   bool isPixel = (memcmp(magicBuf, MAGIC, 4) == 0);
 
   if (!isRun && !isPixel) {
-    Serial.println("Bad magic; flushing stream");
+    Serial.println("Bad magic; dropping client");
     client.stop();
     return false;
   }
@@ -248,29 +341,25 @@ bool handleClient() {
       return false;
     }
 
-    uint8_t entry[4];
-    for (uint16_t i = 0; i < count; i++) {
-      if (!readExactly(client, entry, 4)) {
-        Serial.println("Stream ended mid-frame; dropping client");
-        client.stop();
-        return false;
-      }
-      updateBuffer[i].x = entry[0];
-      updateBuffer[i].y = entry[1];
-      updateBuffer[i].color = entry[2] | (entry[3] << 8);
+    if (!readExactly(client, entry, 6 * count)) {
+      Serial.println("Stream ended mid-frame; dropping client");
+      client.stop();
+      return false;
     }
 
     // Apply all updates in one batch after the full frame is received
-    tft.startWrite();
     for (uint16_t i = 0; i < count; i++) {
-      uint8_t x = updateBuffer[i].x;
-      uint8_t y = updateBuffer[i].y;
+      uint32_t base = i * 6;
+      uint16_t x = entry[base + 0] | entry[base + 1] << 8;
+      uint16_t y = entry[base + 2] | entry[base + 3] << 8;
       if (x < DISPLAY_WIDTH && y < DISPLAY_HEIGHT) {
-        tft.setAddrWindow(x, y, 1, 1);
-        tft.writeColor(updateBuffer[i].color, 1);
+        framebuffer[x + y * DISPLAY_WIDTH] = entry[base + 4] << 8 | entry[base + 5];
         updatesApplied++;
       }
     }
+
+    tft.startWrite();
+    tft.pushImage(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, framebuffer);
     tft.endWrite();
 
     frameCount++;
@@ -322,36 +411,30 @@ bool handleClient() {
     return false;
   }
 
-  // Each run entry: y (1), x0 (1), length (1), color (2) = 5 bytes
-  uint8_t entry[5];
-  for (uint16_t i = 0; i < count; i++) {
-    if (!readExactly(client, entry, 5)) {
-      Serial.println("Stream ended mid-run frame; dropping client");
-      client.stop();
-      return false;
-    }
-    updateBuffer[i].y = entry[0];
-    updateBuffer[i].x = entry[1];
-    updateBuffer[i].len = entry[2];
-    updateBuffer[i].color = entry[3] | (entry[4] << 8);
+  // Each run entry: y (2), x0 (2), length (1), color (2) = 7 bytes
+  if (!readExactly(client, entry, 7 * count)) {
+    Serial.println("Stream ended mid-run frame; dropping client");
+    client.stop();
+    tft.endWrite();
+    return false;
   }
-
-  // Apply runs in one batch
-  tft.startWrite();
   for (uint16_t i = 0; i < count; i++) {
-    uint8_t x0 = updateBuffer[i].x;
-    uint8_t y = updateBuffer[i].y;
-    uint8_t runLen = updateBuffer[i].len;
+    uint16_t base = i * 7;
+    uint16_t color = entry[base + 5] << 8 | entry[base + 6];
+    uint32_t x0 = entry[base + 2] | entry[base + 3] << 8;
+    uint16_t y = entry[base + 0] | entry[base + 1] << 8;
+    uint8_t runLen = entry[base + 4];
     if (x0 < DISPLAY_WIDTH && y < DISPLAY_HEIGHT && runLen > 0 && (x0 + runLen) <= DISPLAY_WIDTH) {
-      tft.setAddrWindow(x0, y, runLen, 1);
-      if (dmaEnabled) {
-        tft.pushBlock(updateBuffer[i].color, runLen);
-      } else {
-        tft.writeColor(updateBuffer[i].color, runLen);
+      x0 += y * DISPLAY_WIDTH;
+      for (uint8_t i = 0; i < runLen; i++) {
+        framebuffer[x0++] = color;
       }
       updatesApplied += runLen;
     }
   }
+
+  tft.startWrite();
+  tft.pushImage(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, framebuffer);
   tft.endWrite();
 
   frameCount++;
@@ -370,12 +453,25 @@ bool handleClient() {
   return true;
 }
 
-void loop() {
-  handleClient();
-  if (client && !client.connected()) {
-    Serial.println("Client disconnected");
-    showWaitingScreen();
+void flushClients() {
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (i != activeClient) {
+      WiFiClient &client = clients[i];
+      if (client && client.connected()) {
+        client.flush();
+      }
+    }
   }
-  delay(1);
+}
+
+void loop() {
+  acceptClients();
+  checkButton();
+
+  if (activeClient >= 0)
+    handleClient();
+
+  flushClients();
+
 }
 
