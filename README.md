@@ -1,6 +1,6 @@
 # ESP32 Desktop Monitor
 
-Stream your computer screen to an ESP32 T-Display over WiFi. This project enables you to mirror your monitor to a small 1.14" LCD display connected to an ESP32.
+Stream your computer screen or other video source to an ESP32 T-Display over WiFi. This project enables you to mirror your monitor to a small LCD display connected to an ESP32.
 
 ## Hardware Requirements
 
@@ -14,6 +14,7 @@ Stream your computer screen to an ESP32 T-Display over WiFi. This project enable
 ### Computer
 - Any computer running Python 3.7+
 - macOS, Linux, or Windows (with appropriate screen capture libraries)
+- Video can be captured from HDMI, DSI (Raspberry PI) or framebuffer
 
 ## Software Requirements
 
@@ -34,8 +35,12 @@ Stream your computer screen to an ESP32 T-Display over WiFi. This project enable
 - Python 3.7 or higher
 - Required packages (install via `pip install -r requirements.txt`):
   - `opencv-python` - Image processing and scaling
-  - `mss` - Cross-platform screen capture
+  - `mss` - Cross-platform screen capture (for HDMI capture)
   - `numpy` - Array operations
+  - `PIL` - Image capture (for DSI)
+  - `subprocess` - Running OS commands (for DSI)
+  - `io` - Core tools for working with streams (for DSI)
+  - `os` - Miscellaneous operating system interfaces (for framebuffer)
 
 ## Setup Instructions
 
@@ -79,10 +84,11 @@ pip install -r requirements.txt
 ### 4. Run the Transmitter
 
 ```bash
-python transmitter.py --ip <ESP32_IP_ADDRESS>
+python transmitter.py --ip <ESP32_IP_ADDRESS> --backend <backend video type>
 ```
 
 Replace `<ESP32_IP_ADDRESS>` with the IP address from step 2.
+Replace `<backend video type>` with your video capture type (windows/dsi/framebuffer)
 
 ## Usage
 
@@ -90,17 +96,19 @@ Replace `<ESP32_IP_ADDRESS>` with the IP address from step 2.
 
 ```bash
 # Stream leftmost monitor to ESP32
-python transmitter.py --ip 192.168.1.100
+python transmitter.py --ip 192.168.1.100 --backend windows
 
 # Stream specific monitor (1-based index)
-python transmitter.py --ip 192.168.1.100 --monitor-index 2
+python transmitter.py --ip 192.168.1.100 --monitor-index 2 --backend windows
 
 # Adjust frame rate (default: 15 FPS)
-python transmitter.py --ip 192.168.1.100 --target-fps 20
+python transmitter.py --ip 192.168.1.100 --target-fps 20 --backend windows
 
 # Adjust change detection sensitivity (default: 5)
-python transmitter.py --ip 192.168.1.100 --threshold 8
+python transmitter.py --ip 192.168.1.100 --threshold 8 --backend windows
 ```
+
+Press the button on the ESP32 to cycle through the available clients (transmitters)
 
 ### Command Line Options
 
@@ -114,6 +122,7 @@ python transmitter.py --ip 192.168.1.100 --threshold 8
 - `--max-updates-per-frame <N>` - Max pixels per packet (default: 3000)
 - `--rotate <0|90|180|270>` - Rotate capture before scaling
 - `--show-cursor` - Draw cursor on captured frame (macOS only)
+- `--backend <windows|dsi|framebuffer>` - Video capture source
 
 ### Performance Tuning
 
@@ -149,6 +158,7 @@ The system uses a custom protocol optimized for small displays:
 2. **Run-Length Encoding**: Consecutive pixels of the same color are encoded as runs
 3. **Automatic Selection**: The sender chooses the most efficient encoding (pixel-by-pixel vs. run-length)
 4. **Batched Updates**: All updates for a frame are received before applying to display
+5. **Client start/stop commands**: Client told to only send updates when it is being displayed
 
 ### Packet Format
 
