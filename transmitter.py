@@ -26,14 +26,15 @@ except Exception:  # noqa: BLE001
 class CGPoint(ctypes.Structure):
     _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
 
-DEFAULT_IP = "192.168.1.100"
+DEFAULT_IP = "192.168.0.68"
 DEFAULT_PORT = 8090
-DISPLAY_WIDTH = 135
-DISPLAY_HEIGHT = 240
+DISPLAY_WIDTH = 240
+DISPLAY_HEIGHT = 320
 HEADER_VERSION = 0x02  # carries frame_id in header (pixels)
 RUN_HEADER_VERSION = 0x01  # version for run packets
-CLIENT_START = 0x31
-CLIENT_STOP = 0x32
+CLIENT_SEND = 0x31
+CLIENT_SEND_FULL = 0x32
+CLIENT_WAIT = 0X33
 
 
 class ScreenshotPixelSender:
@@ -85,17 +86,16 @@ class ScreenshotPixelSender:
             return None
 
     # Connection helpers -------------------------------------------------
-    def ensure_connection(self) -> bool:
+    def ensure_connection(self, retries: int) -> bool:
         if self.sock:
             return True
-        return self.connect()
+        return self.connect(retries)
 
-    def connect(self, retries: int = 3) -> bool:
-        for attempt in range(1, retries + 1):
+    def _connect(self) -> bool:
             try:
                 if self.sock:
                     self.sock.close()
-                print(f"[CONNECT] Attempt {attempt}/{retries} to {self.ip}:{self.port}")
+                print(f"[CONNECT] Attempt connection to {self.ip}:{self.port}")
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.sock.settimeout(10)
@@ -104,8 +104,19 @@ class ScreenshotPixelSender:
                 return True
             except Exception as exc:  # noqa: BLE001
                 print(f"[CONNECT] ✗ {type(exc).__name__}: {exc}")
-                if attempt < retries:
-                    time.sleep(2)
+                time.sleep(2)
+                return False
+
+    def connect(self, retries: int = 3) -> bool:
+        if (retries == 0):
+            while (True):
+                if self._connect():
+                    return True
+
+        for attempt in range(1, retries + 1):
+          if self._connect():
+            return True
+
         return False
 
     def disconnect(self) -> None:
@@ -497,7 +508,7 @@ class ScreenshotPixelSender:
     def run(self) -> None:
         if not self.setup_capture():
             return
-        if not self.ensure_connection():
+        if not self.ensure_connection(0):
             return
 
         frame_delay = 1.0 / self.target_fps if self.target_fps > 0 else 1.0
@@ -506,20 +517,36 @@ class ScreenshotPixelSender:
         sent_pixels = 0
         send_frames = False
         start_t = time.time()
+        last_command_time = time.time()
 
         print("[STREAM] Starting screenshot update loop (Ctrl+C to stop)")
         try:
             while True:
+                if (not self.sock):
+                    print("[STREAM] No active connection")
+                send_frames = False
                 ready, _, _ = select.select([self.sock], [], [], 0)
                 if ready:
-                    data = self.sock.recv(1024)
-                    if (data and data[0] == CLIENT_START):
+                    data = [0] * 100
+                    try:
+                        data = self.sock.recv(1024)
+                    except Exception as exc:
+                        print(f"[RECV] Error receiving data: {type(exc).__name__}: {exc}")
+                        self.disconnect()
+                        self.ensure_connection(0)
+                        continue
+                    if (data and ((data[0] == CLIENT_SEND_FULL) or (len(data) > 1 and data[1] == CLIENT_SEND_FULL))):
                         self.sent_initial_full = False
                         send_frames = True
-                        print("[INIT] Received start command")
-                    if (data and data[0] == CLIENT_STOP):
-                        send_frames = False
-                        print("[INIT] Received stop command")
+                        last_command_time = time.time()
+                    else:
+                        if (data and data[0] == CLIENT_SEND):
+                            send_frames = True
+                            last_command_time = time.time()
+                        else:
+                            if (data and data[0] == CLIENT_WAIT):
+                                last_command_time = time.time()
+
 
                 if send_frames:
                   frame_start = time.time()
@@ -540,13 +567,14 @@ class ScreenshotPixelSender:
                   packets = self.build_packets(rgb, rgb565)
                   self.prev_rgb = rgb
 
-                  if not self.ensure_connection():
+                  if not self.ensure_connection(0):
                       print("[SEND] Could not reconnect; exiting")
                       break
 
                   for pkt in packets:
                       updates_in_frame = struct.unpack_from("<H", pkt, 9)[0]
-                      print(f"[FRAME] id={struct.unpack_from('<I', pkt, 5)[0]} updates={updates_in_frame}")
+                      if (updates_in_frame):
+                          print(f"[FRAME] id={struct.unpack_from('<I', pkt, 5)[0]} updates={updates_in_frame}")
                       try:
                           self.sock.sendall(pkt)
                           sent_packets += 1
@@ -554,18 +582,10 @@ class ScreenshotPixelSender:
                           if not self.sent_initial_full:
                               self.sent_initial_full = True
                       except (BrokenPipeError, ConnectionResetError):
-                          print("[SEND] Connection lost; attempting reconnect")
+                          print("[SEND] Connection lost")
                           self.disconnect()
-                          if not self.ensure_connection():
-                              print("[SEND] Reconnect failed; exiting")
-                              break
-                          try:
-                              self.sock.sendall(pkt)
-                              sent_packets += 1
-                              sent_pixels += updates_in_frame
-                          except Exception as exc:  # noqa: BLE001
-                              print(f"[SEND] Retry failed: {type(exc).__name__}: {exc}")
-                              break
+                          self.ensure_connection(0)
+                          break
                       except Exception as exc:  # noqa: BLE001
                           print(f"[SEND] Error: {type(exc).__name__}: {exc}")
                           #self.disconnect()
@@ -592,13 +612,21 @@ class ScreenshotPixelSender:
                       continue
                   break  # outer while if inner loop broke
                 else:
-                    time.sleep(frame_delay)
+                    if (time.time() - last_command_time > 30.0):  # If no command received in 30 seconds
+                        self.disconnect()
+                        last_command_time = time.time()
+                    else:
+                        time.sleep(frame_delay)
+                    self.ensure_connection(0)
         except KeyboardInterrupt:
             print("\n[STREAM] Interrupted by user")
         finally:
             self.disconnect()
-            if self.sct:
-                self.sct.close()
+            try:
+              if self.sct:
+                  self.sct.close()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[CLOSE] Error closing screenshotter: {type(exc).__name__}: {exc}")
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:

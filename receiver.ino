@@ -1,6 +1,19 @@
+// Must add #include <TFT_eSPI_setup.h> line to TFT_eSPI library user setup file
+
+// To upload: hold down BOOT on right, briefly press EN on left, release BOOT
+// EN is reset, may need to press this to start code running
+
+// ****** IMPORTANT: must get JTAG port to be recognised by Windows, might take some fiddling of connector
+
+// Refer to https://docs.espressif.com/projects/esp-idf/en/stable/esp32/index.html
+
+#include "SPI.h"
+#include "TFT_eSPI.h"
+
+// 192.168.0.68
+
 /*
  * Pixel Update Receiver for ESP32 T-Display (ST7789 135x240)
- * Handles multiple clients and cycles through them using a button
  * Receives per-pixel updates (x, y, RGB565) over TCP and applies them.
  * Protocol v2 (little-endian):
  *   Header: 'P' 'X' 'U' 'P' (4 bytes) + version (1 byte, 0x02) + frame_id (uint32 LE) + count (uint16)
@@ -12,8 +25,7 @@
  * - Run-length encoding support for reduced bandwidth
  */
 
-#include <TFT_eSPI.h>
-#include <SPI.h>
+
 #include <WiFi.h>
 #include <WiFiServer.h>
 #include <esp_heap_caps.h>  // for PSRAM allocations
@@ -25,19 +37,21 @@
 TFT_eSPI tft = TFT_eSPI();
 
 // Display dimensions
-#define DISPLAY_WIDTH 135
-#define DISPLAY_HEIGHT 240
+#define DISPLAY_WIDTH 240
+#define DISPLAY_HEIGHT 320
 #define FRAMEBUFFER_SIZE DISPLAY_WIDTH * DISPLAY_HEIGHT
 
-#define CLIENT_START 0x31
-#define CLIENT_STOP 0x32
+#define CLIENT_SEND 0x31
+#define CLIENT_SEND_FULL 0x32
+#define CLIENT_WAIT 0x33
+#define TIMEOUT 10000
 
 // Try the fastest stable SPI clock for the panel; lower to 40000000 if unstable
 const uint32_t SPI_TARGET_FREQ = 80000000;
 
 // WiFi credentials - UPDATE THESE WITH YOUR NETWORK
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
+const char* ssid = "evans34";
+const char* password = "dYmx#9AZ";
 
 // Network settings
 WiFiServer server(8090);  // dedicated port for pixel updates
@@ -45,7 +59,7 @@ WiFiServer server(8090);  // dedicated port for pixel updates
 WiFiClient clients[MAX_CLIENTS];
 int activeClient = -1;
 
-#define SWITCH_BUTTON 0                   // boot button by default
+#define SWITCH_BUTTON 0                   // boot button
 
 // Protocol constants (v2 adds frame_id to the header)
 const uint8_t MAGIC[4] = {'P', 'X', 'U', 'P'};
@@ -64,19 +78,34 @@ unsigned long frameCount = 0;
 unsigned long lastStats = 0;
 unsigned long updatesApplied = 0;
 uint32_t lastFrameId = 0;
+unsigned long timeOfLastFrame = 0;
 
 struct PixelUpdate {
-  uint8_t x;
-  uint8_t y;
+  uint16_t x;
+  uint16_t y;
   uint8_t len;    // for run packets
   uint16_t color;
 };
 
+uint8_t* entry = nullptr;
 uint32_t bufferCapacity = 0;
 bool dmaEnabled = false;
-uint16_t* framebuffer = nullptr;            // build framebuffer in memory and output full frame after every update
+uint16_t* framebuffer = nullptr;
 
 bool lastButton = HIGH;
+
+void disconnectClient(int cn) {
+  if (clients[cn]) {
+    clients[cn].flush();
+    clients[cn].stop();
+    clients[cn] = WiFiClient();
+    Serial.print("Stopped client ");
+    Serial.println(cn);
+  } else {
+    Serial.print("Unable to stop client ");
+    Serial.println(cn);
+  }
+}
 
 bool ensureUpdateBuffer(uint32_t needed) {
   if (needed <= bufferCapacity && entry != nullptr) {
@@ -100,11 +129,15 @@ bool ensureUpdateBuffer(uint32_t needed) {
 
 bool readExactly(WiFiClient& c, uint8_t* dst, size_t len) {
   size_t got = 0;
+  unsigned long start_t = millis();
   while (got < len && c.connected()) {
     int chunk = c.read(dst + got, len - got);
     if (chunk > 0) {
       got += chunk;
     } else {
+      if (millis() - start_t > TIMEOUT) {
+        return false;
+      }
       delay(1);  // allow other tasks
     }
   }
@@ -199,15 +232,64 @@ void setup() {
   server.begin();
   server.setNoDelay(true);
   Serial.println("Server listening on port 8090");
+
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    clients[i] = WiFiClient();
+  }
+}
+
+void flushBuffer() {
+  if (!clients[activeClient] || !clients[activeClient].connected()) {
+    return;
+  }
+  while (clients[activeClient].available()) {
+    clients[activeClient].read();
+  }
+}
+
+void askForFrame() {
+  if (!clients[activeClient] || !clients[activeClient].connected()) {
+    return;
+  }
+  if (clients[activeClient].available()) {            // if got data, process it first
+    return;
+  }
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (i == activeClient) {
+      clients[i].write(CLIENT_SEND);
+    } else {
+      if (clients[i] && clients[i].connected()) {
+        if (!clients[i].write(CLIENT_WAIT)) {
+          disconnectClient(i);
+        }
+      }
+    }
+  }
+}
+
+void askForFullFrame() {
+  if (!clients[activeClient] || !clients[activeClient].connected()) {
+    return;
+  }
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (i == activeClient) {
+      clients[i].write(CLIENT_SEND_FULL);
+      Serial.println("ask for full frame");
+    } else {
+      if (clients[i] && clients[i].connected()) {
+        if (!clients[i].write(CLIENT_WAIT)) {
+          disconnectClient(i);
+        }
+      }
+    }
+  }
+  timeOfLastFrame = millis();
 }
 
 void switchClient() {
-
+  Serial.print("Switching client, old client = ");
+  Serial.println(activeClient);
   if (activeClient < 0) return;
-
-  if (clients[activeClient] && clients[activeClient].connected()) {
-    clients[activeClient].write(CLIENT_STOP);
-  }
 
   int start = activeClient;
   do {
@@ -219,20 +301,22 @@ void switchClient() {
       Serial.print("Switched to client ");
       Serial.println(activeClient);
       memset(framebuffer, 0, FRAMEBUFFER_SIZE << 1);        // clear buffer
-      clients[activeClient].write(CLIENT_START);
+      flushBuffer();
+      askForFullFrame();
       return;
     }
-
   } while (activeClient != start);
+  activeClient = -1;
+  Serial.println("No active clients");
 }
 
 // remove disconnected clients and potentially add new client
 void acceptClients() {
   WiFiClient newClient = server.available();
 
-  for (int i = 0; i < MAX_CLIENTS; i++) {                 // remove disconnected clients from list
+  for (int i = 0; i < MAX_CLIENTS; i++) {                 // remove disconnected or duplicate clients from list
     if (clients[i] && !clients[i].connected()) {
-      clients[i] = NULL;
+      disconnectClient(i);                                  // destroy client object
       Serial.print("Client ");
       Serial.print(i);
       Serial.println(" disconnected");
@@ -255,7 +339,7 @@ void acceptClients() {
 
         if (activeClient == -1) {
           activeClient = i;
-          clients[activeClient].write(CLIENT_START);
+          askForFullFrame();
         } 
 
         return;
@@ -278,24 +362,32 @@ void checkButton() {
   lastButton = current;
 }
 
+// return true if frame processed so need to ask for another one
 bool handleClient() {
-  if (activeClient < 0) return false;
-
   WiFiClient &client = clients[activeClient];
 
   if (!client || !client.connected()) {
+    switchClient();
     return false;
+  }
+
+  if ((millis() - timeOfLastFrame) > TIMEOUT) {
+    Serial.println("Client timeout");
+    flushBuffer();
+    askForFullFrame();
   }
 
   // Require header to begin processing (pixel or run)
   if (client.available() < 11) {
-    return true;  // keep connection, wait for more data
+    return false;
   }
+
+  timeOfLastFrame = millis();
 
   // Peek magic to decide packet type
   uint8_t magicBuf[4];
   if (!readExactly(client, magicBuf, 4)) {
-    client.stop();
+    disconnectClient(activeClient);
     return false;
   }
   bool isRun = (memcmp(magicBuf, MAGIC_RUN, 4) == 0);
@@ -303,7 +395,7 @@ bool handleClient() {
 
   if (!isRun && !isPixel) {
     Serial.println("Bad magic; dropping client");
-    client.stop();
+    disconnectClient(activeClient);
     return false;
   }
 
@@ -311,13 +403,13 @@ bool handleClient() {
     uint8_t rest[HEADER_SIZE - 4];
     if (!readExactly(client, rest, sizeof(rest))) {
       Serial.println("Failed to read pixel header; dropping client");
-      client.stop();
+      disconnectClient(activeClient);
       return false;
     }
     if (rest[0] != PROTO_VERSION) {
       Serial.print("Unsupported pixel version: ");
       Serial.println(rest[0], HEX);
-      client.stop();
+      disconnectClient(activeClient);
       return false;
     }
 
@@ -331,19 +423,22 @@ bool handleClient() {
     if (count > (DISPLAY_WIDTH * DISPLAY_HEIGHT)) {
       Serial.print("Update count too large: ");
       Serial.println(count);
-      client.stop();
+      disconnectClient(activeClient);
       return false;
     }
 
     if (!ensureUpdateBuffer(count)) {
       Serial.println("No buffer for updates; dropping client");
-      client.stop();
+      disconnectClient(activeClient);
       return false;
     }
 
+    //Serial.print("Reading ");
+    //Serial.print(count);
+    //Serial.println(" pixels");
     if (!readExactly(client, entry, 6 * count)) {
       Serial.println("Stream ended mid-frame; dropping client");
-      client.stop();
+      disconnectClient(activeClient);
       return false;
     }
 
@@ -381,13 +476,13 @@ bool handleClient() {
   uint8_t rest[RUN_HEADER_SIZE - 4];
   if (!readExactly(client, rest, sizeof(rest))) {
     Serial.println("Failed to read run header; dropping client");
-    client.stop();
+    disconnectClient(activeClient);
     return false;
   }
   if (rest[0] != RUN_VERSION) {
     Serial.print("Unsupported run version: ");
     Serial.println(rest[0], HEX);
-    client.stop();
+    disconnectClient(activeClient);
     return false;
   }
 
@@ -401,20 +496,23 @@ bool handleClient() {
   if (count > (DISPLAY_WIDTH * DISPLAY_HEIGHT)) {
     Serial.print("Run count too large: ");
     Serial.println(count);
-    client.stop();
+    disconnectClient(activeClient);
     return false;
   }
 
+  //Serial.print("Reading ");
+  //Serial.print(count);
+  //Serial.println(" RLE pixels");
   if (!ensureUpdateBuffer(count)) {
     Serial.println("No buffer for run updates; dropping client");
-    client.stop();
+    disconnectClient(activeClient);
     return false;
   }
 
   // Each run entry: y (2), x0 (2), length (1), color (2) = 7 bytes
   if (!readExactly(client, entry, 7 * count)) {
     Serial.println("Stream ended mid-run frame; dropping client");
-    client.stop();
+    disconnectClient(activeClient);
     tft.endWrite();
     return false;
   }
@@ -456,9 +554,8 @@ bool handleClient() {
 void flushClients() {
   for (int i = 0; i < MAX_CLIENTS; i++) {
     if (i != activeClient) {
-      WiFiClient &client = clients[i];
-      if (client && client.connected()) {
-        client.flush();
+      if (clients[i] && clients[i].connected()) {
+        clients[i].flush();
       }
     }
   }
@@ -469,9 +566,10 @@ void loop() {
   checkButton();
 
   if (activeClient >= 0)
-    handleClient();
+    if (handleClient()) {
+      askForFrame();
+    }
 
   flushClients();
 
 }
-
