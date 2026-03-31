@@ -451,7 +451,7 @@ bool handleClient() {
         framebuffer[x + y * DISPLAY_WIDTH] = entry[base + 4] << 8 | entry[base + 5];
         updatesApplied++;
       }
-    }
+    } 
 
     tft.startWrite();
     tft.pushImage(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, framebuffer);

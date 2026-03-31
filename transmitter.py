@@ -504,6 +504,34 @@ class ScreenshotPixelSender:
             start = end
         return packets
 
+    def get_command(self) -> int:
+        if (not self.sock):
+            return CLIENT_WAIT
+        ready, _, _ = select.select([self.sock], [], [], 1)
+        if ready:
+            data = [0] * 100
+            try:
+                data = self.sock.recv(1024)
+            except Exception as exc:
+                print(f"[RECV] Error receiving data: {type(exc).__name__}: {exc}")
+                self.disconnect()
+                self.ensure_connection(0)
+                return CLIENT_WAIT
+            if (data and ((data[0] == CLIENT_SEND_FULL) or (len(data) > 1 and data[1] == CLIENT_SEND_FULL))):
+                print("[STREAM] Received full frame request")
+                return CLIENT_SEND_FULL
+            else:
+                if (data and data[0] == CLIENT_SEND):
+                    #print("[STREAM] Received partial frame request")
+                    return CLIENT_SEND
+                else:
+                    if (data and data[0] == CLIENT_WAIT):
+                        #print("[STREAM] Received wait command")
+                        return CLIENT_WAIT
+        else:
+            return 0
+
+
     # Main loop ----------------------------------------------------------
     def run(self) -> None:
         if not self.setup_capture():
@@ -518,6 +546,7 @@ class ScreenshotPixelSender:
         send_frames = False
         start_t = time.time()
         last_command_time = time.time()
+        packets = bytes()
 
         print("[STREAM] Starting screenshot update loop (Ctrl+C to stop)")
         try:
@@ -525,72 +554,56 @@ class ScreenshotPixelSender:
                 if (not self.sock):
                     print("[STREAM] No active connection")
                 send_frames = False
-                ready, _, _ = select.select([self.sock], [], [], 0)
-                if ready:
-                    data = [0] * 100
-                    try:
-                        data = self.sock.recv(1024)
-                    except Exception as exc:
-                        print(f"[RECV] Error receiving data: {type(exc).__name__}: {exc}")
-                        self.disconnect()
-                        self.ensure_connection(0)
-                        continue
-                    if (data and ((data[0] == CLIENT_SEND_FULL) or (len(data) > 1 and data[1] == CLIENT_SEND_FULL))):
+                command = self.get_command()
+                if (command != 0):
+                    if (command == CLIENT_SEND_FULL):
                         self.sent_initial_full = False
                         send_frames = True
                         last_command_time = time.time()
+                        packets = bytes()
                     else:
-                        if (data and data[0] == CLIENT_SEND):
+                        if (command == CLIENT_SEND):
                             send_frames = True
                             last_command_time = time.time()
                         else:
-                            if (data and data[0] == CLIENT_WAIT):
+                            if (command == CLIENT_WAIT):
                                 last_command_time = time.time()
 
 
                 if send_frames:
-                  frame_start = time.time()
-                  frame = self.grab_frame()
-                  if frame is None:
-                      print("[STREAM] Capture stopped")
-                      break
+                  if len(packets) == 0:
+                      frame_start = time.time()
+                      frame = self.grab_frame()
+                      if frame is None:
+                          print("[STREAM] Capture stopped")
+                          break
 
-                  cursor_point = None
-                  if self.show_cursor:
-                      cur = self.get_cursor_global()
-                      if cur:
-                          cursor_point = self.map_cursor_to_local(cur)
-                      else:
-                          print("[CURSOR] Unable to read cursor position")
+                      cursor_point = None
+                      if self.show_cursor:
+                          cur = self.get_cursor_global()
+                          if cur:
+                              cursor_point = self.map_cursor_to_local(cur)
+                          else:
+                              print("[CURSOR] Unable to read cursor position")
 
-                  rgb, rgb565 = self.resize_and_convert(frame, cursor_point)
-                  packets = self.build_packets(rgb, rgb565)
-                  self.prev_rgb = rgb
+                      rgb, rgb565 = self.resize_and_convert(frame, cursor_point)
+                      packets = self.build_packets(rgb, rgb565)
+                      self.prev_rgb = rgb
 
                   if not self.ensure_connection(0):
                       print("[SEND] Could not reconnect; exiting")
                       break
 
-                  for pkt in packets:
-                      updates_in_frame = struct.unpack_from("<H", pkt, 9)[0]
-                      if (updates_in_frame):
-                          print(f"[FRAME] id={struct.unpack_from('<I', pkt, 5)[0]} updates={updates_in_frame}")
-                      try:
-                          self.sock.sendall(pkt)
-                          sent_packets += 1
-                          sent_pixels += updates_in_frame
-                          if not self.sent_initial_full:
-                              self.sent_initial_full = True
-                      except (BrokenPipeError, ConnectionResetError):
-                          print("[SEND] Connection lost")
-                          self.disconnect()
-                          self.ensure_connection(0)
-                          break
-                      except Exception as exc:  # noqa: BLE001
-                          print(f"[SEND] Error: {type(exc).__name__}: {exc}")
-                          #self.disconnect()
-                          #break
-                  else:
+                  pkt = packets.pop(0)
+                  updates_in_frame = struct.unpack_from("<H", pkt, 9)[0]
+                  if (updates_in_frame):
+                      print(f"[FRAME] id={struct.unpack_from('<I', pkt, 5)[0]} updates={updates_in_frame}")
+                  try:
+                      self.sock.sendall(pkt)
+                      sent_packets += 1
+                      sent_pixels += updates_in_frame
+                      if not self.sent_initial_full:
+                          self.sent_initial_full = True
                       frame_count += 1
                       now = time.time()
                       elapsed_frame = now - frame_start
@@ -610,7 +623,14 @@ class ScreenshotPixelSender:
                           sent_packets = 0
                           sent_pixels = 0
                       continue
-                  break  # outer while if inner loop broke
+                  except (BrokenPipeError, ConnectionResetError):
+                      print("[SEND] Connection lost")
+                      self.disconnect()
+                      self.ensure_connection(0)
+                  except Exception as exc:  # noqa: BLE001
+                      print(f"[SEND] Error: {type(exc).__name__}: {exc}")
+                      self.disconnect()
+                      self.ensure_connection(0)
                 else:
                     if (time.time() - last_command_time > 30.0):  # If no command received in 30 seconds
                         self.disconnect()
