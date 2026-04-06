@@ -29,6 +29,7 @@
 #include <WiFi.h>
 #include <WiFiServer.h>
 #include <esp_heap_caps.h>  // for PSRAM allocations
+#include <PNGdec.h>         // for PNG decode
 
 #define TFT_MADCTL 0x36
 #define TFT_MADCTL_RGB 0x00
@@ -59,6 +60,10 @@ WiFiServer server(8090);  // dedicated port for pixel updates
 WiFiClient clients[MAX_CLIENTS];
 int activeClient = -1;
 
+// PNG decode
+PNG png;
+#define PNG_NO_ALPHA 0xffffffff
+
 #define SWITCH_BUTTON 0                   // boot button
 
 // Protocol constants (v2 adds frame_id to the header)
@@ -68,6 +73,9 @@ const size_t HEADER_SIZE = 11;  // MAGIC (4) + version (1) + frame_id (4) + coun
 const uint8_t MAGIC_RUN[4] = {'P', 'X', 'U', 'R'};
 const uint8_t RUN_VERSION = 0x01;
 const size_t RUN_HEADER_SIZE = 11;  // MAGIC_RUN (4) + version (1) + frame_id (4) + count (2)
+const uint8_t MAGIC_PNG[4] = {'P', 'X', 'U', 'C'};
+const uint8_t PNG_VERSION = 0x01;
+const size_t PNG_HEADER_SIZE = 11;  // MAGIC_RUN (4) + version (1) + frame_id (4) + length (2)
 
 // Color configuration (adjust if colors appear swapped)
 bool swapBytesSetting = false;  // keep false; colors are provided as RGB565 little-endian
@@ -114,9 +122,10 @@ bool ensureUpdateBuffer(uint32_t needed) {
   if (entry) {
     free(entry);
   }
-  uint8_t* tmp = (uint8_t*)malloc(needed * sizeof(PixelUpdate));
+  uint8_t* tmp = (uint8_t*)malloc(needed);
   if (!tmp) {
-    tmp = (uint8_t*)ps_malloc(needed * sizeof(PixelUpdate));
+    Serial.println("Switching to PSRAM for entry");
+    tmp = (uint8_t*)ps_malloc(needed);
   }
   if (!tmp) {
     Serial.println("Failed to allocate update buffer");
@@ -362,117 +371,80 @@ void checkButton() {
   lastButton = current;
 }
 
-// return true if frame processed so need to ask for another one
-bool handleClient() {
-  WiFiClient &client = clients[activeClient];
-
-  if (!client || !client.connected()) {
-    switchClient();
-    return false;
-  }
-
-  if ((millis() - timeOfLastFrame) > TIMEOUT) {
-    Serial.println("Client timeout");
-    flushBuffer();
-    askForFullFrame();
-  }
-
-  // Require header to begin processing (pixel or run)
-  if (client.available() < 11) {
-    return false;
-  }
-
-  timeOfLastFrame = millis();
-
-  // Peek magic to decide packet type
-  uint8_t magicBuf[4];
-  if (!readExactly(client, magicBuf, 4)) {
+bool decodePixelFrame(WiFiClient& client) {
+  uint8_t rest[HEADER_SIZE - 4];
+  if (!readExactly(client, rest, sizeof(rest))) {
+    Serial.println("Failed to read pixel header; dropping client");
     disconnectClient(activeClient);
     return false;
   }
-  bool isRun = (memcmp(magicBuf, MAGIC_RUN, 4) == 0);
-  bool isPixel = (memcmp(magicBuf, MAGIC, 4) == 0);
-
-  if (!isRun && !isPixel) {
-    Serial.println("Bad magic; dropping client");
+  if (rest[0] != PROTO_VERSION) {
+    Serial.print("Unsupported pixel version: ");
+    Serial.println(rest[0], HEX);
     disconnectClient(activeClient);
     return false;
   }
 
-  if (isPixel) {
-    uint8_t rest[HEADER_SIZE - 4];
-    if (!readExactly(client, rest, sizeof(rest))) {
-      Serial.println("Failed to read pixel header; dropping client");
-      disconnectClient(activeClient);
-      return false;
-    }
-    if (rest[0] != PROTO_VERSION) {
-      Serial.print("Unsupported pixel version: ");
-      Serial.println(rest[0], HEX);
-      disconnectClient(activeClient);
-      return false;
-    }
-
-    uint32_t frameId = ((uint32_t)rest[1]) | ((uint32_t)rest[2] << 8) | ((uint32_t)rest[3] << 16) | ((uint32_t)rest[4] << 24);
-    uint16_t count = rest[5] | (rest[6] << 8);  // little-endian
-    if (count == 0) {
-      frameCount++;
-      lastFrameId = frameId;
-      return true;
-    }
-    if (count > (DISPLAY_WIDTH * DISPLAY_HEIGHT)) {
-      Serial.print("Update count too large: ");
-      Serial.println(count);
-      disconnectClient(activeClient);
-      return false;
-    }
-
-    if (!ensureUpdateBuffer(count)) {
-      Serial.println("No buffer for updates; dropping client");
-      disconnectClient(activeClient);
-      return false;
-    }
-
-    //Serial.print("Reading ");
-    //Serial.print(count);
-    //Serial.println(" pixels");
-    if (!readExactly(client, entry, 6 * count)) {
-      Serial.println("Stream ended mid-frame; dropping client");
-      disconnectClient(activeClient);
-      return false;
-    }
-
-    // Apply all updates in one batch after the full frame is received
-    for (uint16_t i = 0; i < count; i++) {
-      uint32_t base = i * 6;
-      uint16_t x = entry[base + 0] | entry[base + 1] << 8;
-      uint16_t y = entry[base + 2] | entry[base + 3] << 8;
-      if (x < DISPLAY_WIDTH && y < DISPLAY_HEIGHT) {
-        framebuffer[x + y * DISPLAY_WIDTH] = entry[base + 4] << 8 | entry[base + 5];
-        updatesApplied++;
-      }
-    } 
-
-    tft.startWrite();
-    tft.pushImage(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, framebuffer);
-    tft.endWrite();
-
+  uint32_t frameId = ((uint32_t)rest[1]) | ((uint32_t)rest[2] << 8) | ((uint32_t)rest[3] << 16) | ((uint32_t)rest[4] << 24);
+  uint16_t count = rest[5] | (rest[6] << 8);  // little-endian
+  if (count == 0) {
     frameCount++;
     lastFrameId = frameId;
-    unsigned long now = millis();
-    if (now - lastStats > 2000) {
-      Serial.print("Frames: ");
-      Serial.print(frameCount);
-      Serial.print(" (last frameId ");
-      Serial.print(lastFrameId);
-      Serial.print(") | Updates applied: ");
-      Serial.println(updatesApplied);
-      lastStats = now;
-    }
     return true;
   }
+  if (count > (DISPLAY_WIDTH * DISPLAY_HEIGHT)) {
+    Serial.print("Update count too large: ");
+    Serial.println(count);
+    disconnectClient(activeClient);
+    return false;
+  }
 
-  // Run packet
+  if (!ensureUpdateBuffer(count * sizeof(PixelUpdate))) {
+    Serial.println("No buffer for updates; dropping client");
+    disconnectClient(activeClient);
+    return false;
+  }
+
+  //Serial.print("Reading ");
+  //Serial.print(count);
+  //Serial.println(" pixels");
+  if (!readExactly(client, entry, 6 * count)) {
+    Serial.println("Stream ended mid-frame; dropping client");
+    disconnectClient(activeClient);
+    return false;
+  }
+
+  // Apply all updates in one batch after the full frame is received
+  for (uint16_t i = 0; i < count; i++) {
+    uint32_t base = i * 6;
+    uint16_t x = entry[base + 0] | entry[base + 1] << 8;
+    uint16_t y = entry[base + 2] | entry[base + 3] << 8;
+    if (x < DISPLAY_WIDTH && y < DISPLAY_HEIGHT) {
+      framebuffer[x + y * DISPLAY_WIDTH] = entry[base + 4] << 8 | entry[base + 5];
+      updatesApplied++;
+    }
+  }
+
+  tft.startWrite();
+  tft.pushImage(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, framebuffer);
+  tft.endWrite();
+
+  frameCount++;
+  lastFrameId = frameId;
+  unsigned long now = millis();
+  if (now - lastStats > 2000) {
+    Serial.print("Frames: ");
+    Serial.print(frameCount);
+    Serial.print(" (last frameId ");
+    Serial.print(lastFrameId);
+    Serial.print(") | Updates applied: ");
+    Serial.println(updatesApplied);
+    lastStats = now;
+  }
+  return true;
+}
+
+bool decodeRunFrame(WiFiClient& client) {
   uint8_t rest[RUN_HEADER_SIZE - 4];
   if (!readExactly(client, rest, sizeof(rest))) {
     Serial.println("Failed to read run header; dropping client");
@@ -503,7 +475,7 @@ bool handleClient() {
   //Serial.print("Reading ");
   //Serial.print(count);
   //Serial.println(" RLE pixels");
-  if (!ensureUpdateBuffer(count)) {
+  if (!ensureUpdateBuffer(count * sizeof(PixelUpdate))) {
     Serial.println("No buffer for run updates; dropping client");
     disconnectClient(activeClient);
     return false;
@@ -513,7 +485,6 @@ bool handleClient() {
   if (!readExactly(client, entry, 7 * count)) {
     Serial.println("Stream ended mid-run frame; dropping client");
     disconnectClient(activeClient);
-    tft.endWrite();
     return false;
   }
   for (uint16_t i = 0; i < count; i++) {
@@ -549,6 +520,139 @@ bool handleClient() {
   }
 
   return true;
+}
+
+int decodeLine(PNGDRAW *pDraw) {
+  uint16_t line[DISPLAY_WIDTH];
+  uint16_t *ptr;
+  png.getLineAsRGB565(pDraw, line, PNG_RGB565_BIG_ENDIAN, PNG_NO_ALPHA);
+  ptr = framebuffer + pDraw->y * DISPLAY_WIDTH;
+  memcpy(ptr, line, DISPLAY_WIDTH << 1);
+  return 1;
+}
+
+bool decodePngFrame(WiFiClient& client) {
+  Serial.println("Decoding PNG packet");
+  uint8_t rest[PNG_HEADER_SIZE - 4];
+  if (!readExactly(client, rest, sizeof(rest))) {
+    Serial.println("Failed to read PNG header; dropping client");
+    disconnectClient(activeClient);
+    return false;
+  }
+  if (rest[0] != PNG_VERSION) {
+    Serial.print("Unsupported PNG version: ");
+    Serial.println(rest[0], HEX);
+    disconnectClient(activeClient);
+    return false;
+  }
+
+  uint32_t frameId = ((uint32_t)rest[1]) | ((uint32_t)rest[2] << 8) | ((uint32_t)rest[3] << 16) | ((uint32_t)rest[4] << 24);
+  uint16_t count = rest[5] | (rest[6] << 8);  // little-endian
+  if (count == 0) {
+    frameCount++;
+    lastFrameId = frameId;
+    return true;
+  }
+
+  if (!ensureUpdateBuffer(count)) {
+    Serial.println("No buffer for updates; dropping client");
+    disconnectClient(activeClient);
+    return false;
+  }
+
+  //Serial.print("Reading ");
+  //Serial.print(count);
+  //Serial.println(" bytes");
+  if (!readExactly(client, entry, count)) {
+    Serial.println("Stream ended mid-frame; dropping client");
+    disconnectClient(activeClient);
+    return false;
+  }
+
+  int status = png.openRAM(entry, count, decodeLine);
+  if (status == PNG_SUCCESS) {
+    status = png.decode(NULL, 0);
+    png.close();
+    if (status != PNG_SUCCESS) {
+      Serial.print("Error decoding PNG packet, error = ");
+      Serial.println(status);
+      disconnectClient(activeClient);
+      return false;
+    }
+
+    tft.startWrite();
+    tft.pushImage(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, framebuffer);
+    tft.endWrite();
+
+    frameCount++;
+    lastFrameId = frameId;
+    unsigned long now = millis();
+    if (now - lastStats > 2000) {
+      Serial.print("Frames: ");
+      Serial.print(frameCount);
+      Serial.print(" (last frameId ");
+      Serial.print(lastFrameId);
+      Serial.print(") | Updates applied: ");
+      Serial.println(updatesApplied);
+      lastStats = now;
+    }
+    return true;
+
+  } else {
+    Serial.print("Error opening PNG packet, status = ");
+    Serial.println(status);
+    disconnectClient(activeClient);
+    return false;
+  }
+}
+
+// return true if frame processed so need to ask for another one
+bool handleClient() {
+  WiFiClient &client = clients[activeClient];
+
+  if (!client || !client.connected()) {
+    switchClient();
+    return false;
+  }
+
+  if ((millis() - timeOfLastFrame) > TIMEOUT) {
+    Serial.println("Client timeout");
+    flushBuffer();
+    askForFullFrame();
+  }
+
+  // Require header to begin processing (pixel or run)
+  if (client.available() < 11) {
+    return false;
+  }
+
+  timeOfLastFrame = millis();
+
+  // Peek magic to decide packet type
+  uint8_t magicBuf[4];
+  if (!readExactly(client, magicBuf, 4)) {
+    disconnectClient(activeClient);
+    return false;
+  }
+  bool isRun = (memcmp(magicBuf, MAGIC_RUN, 4) == 0);
+  bool isPixel = (memcmp(magicBuf, MAGIC, 4) == 0);
+  bool isPng = (memcmp(magicBuf, MAGIC_PNG, 4) == 0);
+
+  if (isPixel) {
+    return decodePixelFrame(client);
+  }
+
+  if (isRun) {
+    return decodeRunFrame(client);
+  }
+
+  if (isPng) {
+    return decodePngFrame(client);
+  }
+
+  Serial.println("Bad magic; dropping client");
+  disconnectClient(activeClient);
+  return false;
 }
 
 void flushClients() {
