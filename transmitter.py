@@ -15,6 +15,8 @@ from typing import Optional, Sequence
 import cv2
 import numpy as np
 import ctypes
+from PIL import Image
+from io import BytesIO
 
 try:
     from Quartz import CGEventCreate, CGEventGetLocation
@@ -32,6 +34,7 @@ DISPLAY_WIDTH = 240
 DISPLAY_HEIGHT = 320
 HEADER_VERSION = 0x02  # carries frame_id in header (pixels)
 RUN_HEADER_VERSION = 0x01  # version for run packets
+PNG_HEADER_VERSION = 0x01   # version for png packet
 CLIENT_SEND = 0x31
 CLIENT_SEND_FULL = 0x32
 CLIENT_WAIT = 0X33
@@ -421,13 +424,21 @@ class ScreenshotPixelSender:
         # Try run-length encoding by rows; choose smaller payload
         run_packets = self._build_run_packets(mask, rgb565)
         pixel_packets = self._build_pixel_packets(xs, ys, colors, count)
+        png_packet = self._build_png_packet(rgb)
 
         run_bytes = sum(len(p) for p in run_packets)
         pixel_bytes = sum(len(p) for p in pixel_packets)
+        png_bytes = sum(len(p) for p in png_packet)
+        if (png_bytes < run_bytes and png_bytes < pixel_bytes and png_bytes <= 0xffff):
+            self.frame_id += png_bytes
+            #print(f"Sending PNG packet: {png_bytes} bytes")
+            return png_packet
         if run_bytes < pixel_bytes:
             self.frame_id += len(run_packets)
+            #print(f"Sending RUN packets: {run_bytes} bytes")
             return run_packets
         self.frame_id += len(pixel_packets)
+        #print(f"Sending PIXEL packets: {pixel_bytes} bytes")
         return pixel_packets
 
     def _build_pixel_packets(
@@ -503,6 +514,20 @@ class ScreenshotPixelSender:
             packets.append(bytes(payload))
             start = end
         return packets
+
+    def _build_png_packet(self, rgb: np.ndarray) -> list[bytes]:
+        # Convert ndarray to PIL image
+        img = Image.fromarray(rgb)
+        # Save PNG into an in-memory buffer
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        # Get raw PNG bytes
+        png_bytes = buffer.getvalue()
+        return  ([b"PXUC"
+                 + bytes([PNG_HEADER_VERSION])
+                 + struct.pack("<I", self.frame_id)
+                 + struct.pack("<H", len(png_bytes) & 0xffff)          # note packet will be rejected if larger than 65535 anyway
+                 + png_bytes])
 
     def get_command(self) -> int:
         if (not self.sock):
