@@ -11,6 +11,9 @@ import select
 import struct
 import time
 from typing import Optional, Sequence
+import sys
+import os
+import subprocess
 
 import cv2
 import numpy as np
@@ -67,6 +70,9 @@ class ScreenshotPixelSender:
         self.show_cursor = show_cursor
         self.backend = backend
 
+        if self.backend is None:
+          self.backend = self.detect_platform()
+
         self.sock: Optional[socket.socket] = None
         self.prev_rgb: Optional[np.ndarray] = None  # (H, W, 3) uint8
         self.sent_initial_full: bool = False
@@ -74,6 +80,35 @@ class ScreenshotPixelSender:
         self.monitor: Optional[dict] = None
         self.cursor_warned: bool = False
         self.cursor_backend: Optional[tuple[str, Optional[ctypes.CDLL]]] = self._init_cursor_backend()
+
+    def detect_platform(self) -> str:
+        #Returns one of: 'framebuffer', 'dsi', 'windows'
+
+        # 1. Windows — quick and unambiguous
+        if sys.platform == 'win32':
+            return 'windows'
+
+        # 2. We're on Linux — now distinguish framebuffer vs DSI
+
+        # Check for DSI display via connected displays in /sys
+        dsi_path = '/sys/class/drm'
+        if os.path.exists(dsi_path):
+            for entry in os.listdir(dsi_path):
+                # DSI connectors show up as 'DSI-1', 'card0-DSI-1', etc.
+                if 'DSI' in entry.upper():
+                    # Confirm it's actually connected
+                    status_file = os.path.join(dsi_path, entry, 'status')
+                    if os.path.exists(status_file):
+                        with open(status_file) as f:
+                            if f.read().strip() == 'connected':
+                                return 'dsi'
+
+        # Check for an active framebuffer device
+        if os.path.exists('/dev/fb0'):
+            return 'framebuffer'
+
+        # Fallback
+        raise RuntimeError("Could not detect display type")
 
     def _init_cursor_backend(self) -> Optional[tuple[str, Optional[ctypes.CDLL]]]:
         # Prefer Quartz if available (pyobjc); otherwise fall back to CoreGraphics via ctypes
@@ -429,6 +464,7 @@ class ScreenshotPixelSender:
         run_bytes = sum(len(p) for p in run_packets)
         pixel_bytes = sum(len(p) for p in pixel_packets)
         png_bytes = sum(len(p) for p in png_packet)
+        #print(f"Run bytes: {run_bytes}, Pixel bytes: {pixel_bytes}, PNG bytes: {png_bytes}")
         if (png_bytes < run_bytes and png_bytes < pixel_bytes and png_bytes <= 0xffff):
             self.frame_id += png_bytes
             #print(f"Sending PNG packet: {png_bytes} bytes")
@@ -729,7 +765,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--backend",
         choices=["windows", "dsi", "framebuffer"],
-        required=True,
+        required=False,
         help="Capture backend to use (windows/dsi/framebuffer)"
     )
     return parser.parse_args(argv)
