@@ -20,6 +20,7 @@ import numpy as np
 import ctypes
 from PIL import Image
 from io import BytesIO
+import re
 
 try:
     from Quartz import CGEventCreate, CGEventGetLocation
@@ -31,15 +32,14 @@ except Exception:  # noqa: BLE001
 class CGPoint(ctypes.Structure):
     _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
 
-DEFAULT_IP = "192.168.0.68"
+DEFAULT_IP = "192.168.0.99"
 DEFAULT_PORT = 8090
-DISPLAY_WIDTH = 240
-DISPLAY_HEIGHT = 320
 HEADER_VERSION = 0x02  # carries frame_id in header (pixels)
 RUN_HEADER_VERSION = 0x01  # version for run packets
 PNG_HEADER_VERSION = 0x01   # version for png packet
 CLIENT_SEND = 0x31
 CLIENT_SEND_FULL = 0x32
+CLIENT_VERSION = 0x01
 CLIENT_WAIT = 0X33
 
 
@@ -66,7 +66,7 @@ class ScreenshotPixelSender:
         self.threshold = threshold
         self.full_frame = full_frame
         self.max_updates_per_frame = max_updates_per_frame
-        self.rotate_deg = rotate_deg
+        self.rotate_deg_user = rotate_deg
         self.show_cursor = show_cursor
         self.backend = backend
 
@@ -80,6 +80,9 @@ class ScreenshotPixelSender:
         self.monitor: Optional[dict] = None
         self.cursor_warned: bool = False
         self.cursor_backend: Optional[tuple[str, Optional[ctypes.CDLL]]] = self._init_cursor_backend()
+        self.remoteWidth = None
+        self.remoteHeight = None
+
 
     def detect_platform(self) -> str:
         #Returns one of: 'framebuffer', 'dsi', 'windows'
@@ -207,6 +210,7 @@ class ScreenshotPixelSender:
             return False
 
         self.monitor = monitor
+        self.displayPortrait = monitor['width'] < monitor['height']
         print(
             f"[MON] Using monitor at ({monitor['left']}, {monitor['top']}) "
             f"{monitor['width']}x{monitor['height']}"
@@ -221,6 +225,13 @@ class ScreenshotPixelSender:
             # Check if grim is available
             subprocess.run(["grim", "-h"], capture_output=True, check=True)
             print(f"[MON] Found grim. Target display: {self.display_name}")
+            result = subprocess.run(['wlr-randr'], capture_output=True, text=True)
+            match = re.search(r'(\d+)x(\d+)', result.stdout)
+            if match:
+              w, h =  int(match.group(1)), int(match.group(2))
+              self.displayPortrait = w < h
+            else:
+                self.displayPortrait = True
             return True
         except Exception as exc:
             print(f"[MON] grim not found. Install it with 'sudo apt install grim'. Error: {exc}")
@@ -228,14 +239,27 @@ class ScreenshotPixelSender:
 
     def setup_capture_framebuffer(self) -> bool:
         import os
+        import fcntl
         self.fb_device = "/dev/fb0"  # Default for most small LCDs
-        self.width = 240            # Match your local LCD's hardware resolution
-        self.height = 320
         self.bpp = 2                # 2 for RGB565 (16-bit), 4 for RGBA (32-bit)
         if os.path.exists(self.fb_device):
             print(f"[MON] Found framebuffer at {self.fb_device}")
+            FBIOGET_VSCREENINFO = 0x4600
+            try:
+                with open(self.fb_device, 'rb') as f:
+                    # struct fb_var_screeninfo - first two uint32s are xres and yres
+                    data = fcntl.ioctl(f, FBIOGET_VSCREENINFO, bytes(160))
+                    self.width, self.height = struct.unpack_from('II', data, 0)
+                    self.displayPortrait = self.width < self.height
+            except Exception:
+                self.width = 240            # Match your local LCD's hardware resolution
+                self.height = 320
+                self.displayPortrait = True
+                print(f"[MON] Unable to read resolution from {self.fb_device}.")
+                return False
             return True
         print(f"[MON] {self.fb_device} not found. Check if your LCD driver is loaded.")
+        self.displayPortrait = True
         return False
 
     def setup_capture(self) -> bool:
@@ -424,7 +448,7 @@ class ScreenshotPixelSender:
         elif self.rotate_deg == 270:
             frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-        resized = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
+        resized = cv2.resize(frame, (self.remoteWidth, self.remoteHeight))
 
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         rgb565 = self.rgb888_to_rgb565(rgb)
@@ -434,7 +458,7 @@ class ScreenshotPixelSender:
     def build_packets(self, rgb: np.ndarray, rgb565: np.ndarray) -> list[bytes]:
         # Force the first frame to be full-frame, then optionally delta-mode
         if self.full_frame or not self.sent_initial_full or self.prev_rgb is None:
-            mask = np.ones((DISPLAY_HEIGHT, DISPLAY_WIDTH), dtype=bool)
+            mask = np.ones((self.remoteHeight, self.remoteWidth), dtype=bool)
         else:
             diff = np.abs(rgb.astype(np.int16) - self.prev_rgb.astype(np.int16))
             mask = diff.max(axis=2) > self.threshold
@@ -505,19 +529,19 @@ class ScreenshotPixelSender:
         max_per = max(1, self.max_updates_per_frame)
         runs: list[tuple[int, int, int, int]] = []  # y, x0, length, color
 
-        for y in range(DISPLAY_HEIGHT):
+        for y in range(self.remoteHeight):
             row_mask = mask[y]
             if not row_mask.any():
                 continue
             x = 0
-            while x < DISPLAY_WIDTH:
+            while x < self.remoteWidth:
                 if not row_mask[x]:
                     x += 1
                     continue
                 x0 = x
                 color = int(rgb565[y, x0])
                 x += 1
-                while x < DISPLAY_WIDTH and row_mask[x] and int(rgb565[y, x]) == color:
+                while x < self.remoteWidth and row_mask[x] and int(rgb565[y, x]) == color:
                     x += 1
                 length = x - x0
                 runs.append((y, x0, length, color))
@@ -565,6 +589,13 @@ class ScreenshotPixelSender:
                  + struct.pack("<H", len(png_bytes) & 0xffff)          # note packet will be rejected if larger than 65535 anyway
                  + png_bytes])
 
+    def _calculate_rotation(self) -> int:
+        remotePortrait = self.remoteWidth < self.remoteHeight
+        if (remotePortrait == self.displayPortrait):
+            return 0
+        else:
+            return 270
+
     def get_command(self) -> int:
         if (not self.sock):
             return CLIENT_WAIT
@@ -578,8 +609,15 @@ class ScreenshotPixelSender:
                 self.disconnect()
                 self.ensure_connection(0)
                 return CLIENT_WAIT
-            if (data and ((data[0] == CLIENT_SEND_FULL) or (len(data) > 1 and data[1] == CLIENT_SEND_FULL))):
+            if (data and ((data[0] == CLIENT_SEND_FULL) and (len(data) == 6) and (data[1] == CLIENT_VERSION))):
                 print("[STREAM] Received full frame request")
+                self.remoteWidth = (data[2] << 8) | data[3]
+                self.remoteHeight = (data[4] << 8) | data[5]
+                print(f"[STREAM] Display dimensions: {self.remoteWidth} x {self.remoteHeight}")
+                if (self.rotate_deg_user == "auto"):
+                    self.rotate_deg = self._calculate_rotation()
+                else:
+                    self.rotate_deg = int(self.rotate_deg_user)
                 return CLIENT_SEND_FULL
             else:
                 if (data and data[0] == CLIENT_SEND):
@@ -752,9 +790,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--rotate",
-        type=int,
-        choices=[0, 90, 180, 270],
-        default=0,
+        choices=["0", "90", "180", "270", "auto"],
+        default="auto",
         help="Rotate capture before scaling to match device orientation",
     )
     parser.add_argument(
