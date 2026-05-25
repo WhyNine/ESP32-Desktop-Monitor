@@ -1,5 +1,7 @@
 # ESP32 Desktop Monitor
 
+THIS IS OUT OF DATE
+
 Stream your computer screen or other video source to an ESP32 T-Display over WiFi. This project enables you to mirror your monitor to a small LCD display connected to an ESP32.
 
 ## Hardware Requirements

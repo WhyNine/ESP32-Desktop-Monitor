@@ -1,5 +1,7 @@
 # Quick Start Guide
 
+THIS IS OUT OF DATE
+
 ## 5-Minute Setup
 
 ### Step 1: Flash ESP32 (One-time setup)
