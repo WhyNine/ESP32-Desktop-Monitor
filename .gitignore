@@ -4,3 +4,4 @@ ST7789T3_SPEC_V1.0.pdf
 TFT_eSPI_setup.h
 receiver2/Schematic_ESP-pendulum-timer_2025-03-26.pdf
 receiver2/Fermion 1.8 128x160 IPS TFT LCD Display with MicroSD Card Slot (Breakout) Wiki - DFRobot - wiki.dfrobot.com_.pdf
+receiver2/credentials.h

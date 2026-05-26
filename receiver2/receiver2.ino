@@ -31,6 +31,7 @@
 #include <WiFiServer.h>
 #include <esp_heap_caps.h>  // for PSRAM allocations
 #include <PNGdec.h>         // for PNG decode
+#include "credentials.h"
 
 #define TFT_MADCTL 0x36
 #define TFT_MADCTL_RGB 0x00
@@ -59,8 +60,8 @@ uint8_t CLIENT_SEND_FULL[] = {
 const uint32_t SPI_TARGET_FREQ = 80000000;
 
 // WiFi credentials - UPDATE THESE WITH YOUR NETWORK
-const char* ssid = "evans34";
-const char* password = "dYmx#9AZ";
+//const char* ssid = "";
+//const char* password = "";
 
 // Network settings
 WiFiServer server(8090);  // dedicated port for pixel updates

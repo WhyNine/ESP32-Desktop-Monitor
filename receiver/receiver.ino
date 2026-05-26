@@ -51,8 +51,8 @@ TFT_eSPI tft = TFT_eSPI();
 const uint32_t SPI_TARGET_FREQ = 80000000;
 
 // WiFi credentials - UPDATE THESE WITH YOUR NETWORK
-const char* ssid = "evans34";
-const char* password = "dYmx#9AZ";
+//const char* ssid = "";
+//const char* password = "";
 
 // Network settings
 WiFiServer server(8090);  // dedicated port for pixel updates
